@@ -1,6 +1,6 @@
 # SNPeff Load Workflow Notes
 
-This folder contains three scripts that I use together to build a `snpEff` database, annotate a VCF, and then summarise realised and masked genetic load in a consistent way across projects.
+This folder contains four scripts that I use together to build a `snpEff` database, annotate a VCF, summarise realised and masked genetic load, and then plot the results in a consistent way across projects.
 
 This is not meant to be polished software documentation. It is a working note for future analyses, so the main aim is to explain clearly what each script does, what goes in, what comes out, and what assumptions are being made.
 
@@ -8,7 +8,8 @@ This is not meant to be polished software documentation. It is a working note fo
 
 - `build_snpeff_db.sh`
 - `annotate_snpeff_vcf.sh`
-- `summarize_snpeff_load.sh`
+- `summarise_snpeff_load.sh`
+- `plot_snpeff_load.R`
 
 ## Overall Logic
 
@@ -17,12 +18,14 @@ The workflow is:
 1. Prepare a `snpEff` reference database from a FASTA and GFF.
 2. Annotate a VCF with `snpEff`.
 3. Polarise variants using an outgroup and summarise load statistics from the annotated VCF.
+4. Plot per-individual load values and pairwise population `Rxy`.
 
 The purpose of keeping these three steps separate is:
 
 - the reference database usually only needs to be built once per reference genome
 - annotation may be repeated for multiple VCFs against the same reference
 - load summaries may be rerun multiple times with different outgroup definitions, population files, or uncertainty settings
+- plots may be rerun with different population files without touching the earlier steps
 
 ## Software Needed
 
@@ -182,7 +185,7 @@ input.anno.vcf.gz
 ## Step 3: Summarise Realised And Masked Load
 
 Script:
-- [`summarize_snpeff_load.sh`](./summarize_snpeff_load.sh)
+- [`summarise_snpeff_load.sh`](./summarise_snpeff_load.sh)
 
 ### Why this step exists
 
@@ -370,7 +373,7 @@ Useful optional arguments:
 ### Example
 
 ```bash
-sbatch summarize_snpeff_load.sh \
+sbatch summarise_snpeff_load.sh \
   --vcf /path/input.anno.vcf.gz \
   --groups /path/Pops.txt \
   --jackknife-bins 100
@@ -388,6 +391,123 @@ the default output will be:
 
 ```text
 input.anno.load_summary.tsv
+```
+
+## Step 4: Plot Individual Load And Population Rxy
+
+Script:
+- [`plot_snpeff_load.R`](./plot_snpeff_load.R)
+
+### Why this step exists
+
+After making the load summary table, I usually want two things:
+
+- per-individual plots of realised and masked load
+- pairwise `Rxy` comparisons between populations
+
+This script takes the final load summary table and a sample-to-population file, filters to the samples I want to include, and writes both figures and tables.
+
+### Input files
+
+The script needs:
+
+1. a load summary table from `summarise_snpeff_load.sh`
+2. a two-column sample/population file
+
+The plotting population file is separate from the ingroup/outgroup file used during the load calculation. That way I can keep the load definition fixed but regroup samples however I want for plotting.
+
+### Plot population file format
+
+Example:
+
+```tsv
+DRR250459_UAmap	Japan
+DRR320311_UAmap	Japan
+NE_01_UAmap	Mainland
+NE_02_UAmap	Mainland
+SW_01_UAmap	Mainland
+SW_02_UAmap	Mainland
+```
+
+Only samples present in this file are kept for plotting. If a sample is in the load summary table but not in this file, it is ignored.
+
+### What the script produces
+
+#### Individual load plots
+
+The script makes:
+
+- one LoF plot
+- one nonsynonymous plot
+
+For each individual:
+
+- realised load is plotted on the left y-axis
+- masked load is plotted on the right y-axis
+- points are coloured by population
+- confidence intervals are drawn if present in the load table
+
+The four plotted values of interest are:
+
+- `lof_realised_over_synonymous_total`
+- `lof_masked_over_synonymous_total`
+- `nonsynonymous_realised_over_synonymous_total`
+- `nonsynonymous_masked_over_synonymous_total`
+
+#### Rxy output
+
+The script also calculates pairwise population `Rxy` from the same four metrics.
+
+If there are exactly two populations:
+
+- it calculates all pairwise between-population sample ratios
+- it writes those values to `*.rxy_pairwise.tsv`
+- it plots them as boxplots
+- it overlays the population-mean `Rxy` as a point
+- it draws a horizontal line at `Rxy = 1`
+
+If there are more than two populations:
+
+- it writes the pairwise population summary table
+- it makes a heatmap instead
+
+### Output files
+
+Typical outputs are:
+
+```text
+prefix.lof_dual_axis.pdf
+prefix.lof_dual_axis.png
+prefix.nonsynonymous_dual_axis.pdf
+prefix.nonsynonymous_dual_axis.png
+prefix.rxy.tsv
+prefix.population_means.tsv
+prefix.samples_used.tsv
+```
+
+If there are two populations:
+
+```text
+prefix.rxy_boxplot.pdf
+prefix.rxy_boxplot.png
+prefix.rxy_pairwise.tsv
+```
+
+If there are more than two populations:
+
+```text
+prefix.rxy_heatmap.pdf
+prefix.rxy_heatmap.png
+```
+
+### Example
+
+```bash
+Rscript plot_snpeff_load.R \
+  --load /path/input.anno.load_summary.tsv \
+  --groups /path/Plot_pops.txt \
+  --outdir /path/load_plots \
+  --prefix modern_bears
 ```
 
 ## End-To-End Example
@@ -429,10 +549,20 @@ SW_03_UAmap	ingroup
 ### 4. Summarise realised and masked load
 
 ```bash
-sbatch summarize_snpeff_load.sh \
+sbatch summarise_snpeff_load.sh \
   --vcf /path/modern_bears.anno.vcf.gz \
   --groups /path/Pops.txt \
   --jackknife-bins 100
+```
+
+### 5. Plot individual load and Rxy
+
+```bash
+Rscript plot_snpeff_load.R \
+  --load /path/modern_bears.anno.load_summary.tsv \
+  --groups /path/Plot_pops.txt \
+  --outdir /path/load_plots \
+  --prefix modern_bears
 ```
 
 ## Practical Notes For Future Use
@@ -453,3 +583,5 @@ If I forget the order:
 2. annotate VCF
 3. prepare `Pops.txt`
 4. summarise load
+5. prepare `Plot_pops.txt`
+6. make plots
