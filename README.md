@@ -170,6 +170,38 @@ It:
 
 The simplification step is deliberate. Once a site has been flipped, many allele-dependent fields such as `AD`, `PL`, `AC`, and `AF` are no longer safe to trust unless they are recalculated. Since I only need this VCF for `snpEff` and the downstream load script, it is cleaner to keep genotypes only.
 
+### Optional parallel batching inside one job
+
+For large VCFs, the polarisation step can be sped up without using a Slurm array. The script can:
+
+1. detect chromosome names automatically from a bgzipped VCF
+2. create a tabix index automatically if it is missing
+3. split chromosomes into internal batches
+4. run those batches in parallel within a single job
+5. merge the batch outputs back into one final polarised VCF
+
+This is controlled with:
+
+- `-c N` or `--chromosomes-per-batch N`
+
+The number of simultaneous batch workers is taken from `SLURM_CPUS_PER_TASK` if available, so I can submit one job with multiple CPUs and let the script manage the parallel chromosome batches internally.
+
+For example:
+
+```bash
+sbatch --cpus-per-task=10 polarise_snpeff_vcf.sh \
+  --vcf /path/input.vcf.gz \
+  --groups /path/Pops.txt \
+  -c 10
+```
+
+In that example:
+
+- `--cpus-per-task=10` means up to 10 chromosome batches can run at once
+- `-c 10` means each batch contains 10 chromosomes
+
+These are different settings. One controls parallelism, the other controls batch size.
+
 ### Important input arguments
 
 - `--vcf`: unannotated input VCF or VCF.GZ
@@ -178,6 +210,7 @@ The simplification step is deliberate. Once a site has been flipped, many allele
 Useful optional arguments:
 
 - `--out`: custom output file name
+- `-c N`: process chromosomes in internal batches of `N` at a time
 - `--allow-missing-outgroup`: allow missing outgroup calls, as long as all called outgroups still agree on the same homozygous allele
 - `--force`: overwrite existing output
 - `--skip-if-exists`: do nothing if the output already exists
