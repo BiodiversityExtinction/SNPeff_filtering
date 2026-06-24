@@ -19,10 +19,10 @@ Required arguments:
 Optional arguments:
   --out FILE           Output annotated VCF.GZ
                        Default: input with .anno.vcf.gz suffix
-  --snpeff-dir DIR     Directory containing snpEff.jar
-                       Default: /home/people/micwe/Biodiversity_Extinction/Software/snpEff
+  --jar FILE           Path to snpEff.jar
+                       Default: none; must be provided unless you edit the script
   --config FILE        snpEff config file
-                       Default: /home/people/micwe/Biodiversity_Extinction/Reference_genomes/SNPeff/snpEff.config
+                       Default: none; must be provided unless you edit the script
   --java BIN           Java binary to use
                        Default: java from PATH
   --bgzip BIN          bgzip binary to use
@@ -40,7 +40,9 @@ What it does:
 Example:
   sbatch annotate_snpeff_vcf.sh \
     --vcf /path/sample.vcf.gz \
-    --db-id brown_bear
+    --db-id brown_bear \
+    --jar /path/snpEff.jar \
+    --config /path/snpEff.config
 EOF
 }
 
@@ -57,8 +59,8 @@ require_file() {
 VCF=""
 DB_ID=""
 OUT=""
-SNPEFF_DIR="/home/people/micwe/Biodiversity_Extinction/Software/snpEff"
-CONFIG="/home/people/micwe/Biodiversity_Extinction/Reference_genomes/SNPeff/snpEff.config"
+SNPEFF_JAR=""
+CONFIG=""
 JAVA_BIN=""
 BGZIP_BIN=""
 FORCE=0
@@ -78,8 +80,8 @@ while [[ $# -gt 0 ]]; do
       OUT="${2:-}"
       shift 2
       ;;
-    --snpeff-dir)
-      SNPEFF_DIR="${2:-}"
+    --jar)
+      SNPEFF_JAR="${2:-}"
       shift 2
       ;;
     --config)
@@ -116,9 +118,10 @@ done
 [[ -n "$DB_ID" ]] || die "--db-id is required"
 
 require_file "$VCF"
-require_file "$CONFIG"
+[[ -n "$SNPEFF_JAR" ]] || die "--jar is required unless you set a default in the script"
+[[ -n "$CONFIG" ]] || die "--config is required unless you set a default in the script"
 
-SNPEFF_JAR="${SNPEFF_DIR}/snpEff.jar"
+require_file "$CONFIG"
 require_file "$SNPEFF_JAR"
 
 if [[ -z "$JAVA_BIN" ]]; then

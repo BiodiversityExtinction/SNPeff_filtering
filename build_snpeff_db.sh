@@ -41,9 +41,9 @@ Example:
     --outdir /path/SNPeff \
     --db-id brown_bear \
     --genome-name Brown_bear \
-    --config-template /projects/mjolnir1/people/gnr216/a-software/snpEff/snpEff.config \
-    --java /usr/lib/jvm/java-19-openjdk-19.0.1.0.10-1.rolling.el8.x86_64/bin/java \
-    --jar /projects/mjolnir1/people/gnr216/a-software/snpEff/snpEff.jar \
+    --config-template /path/snpEff.config \
+    --java /path/java \
+    --jar /path/snpEff.jar \
     --build
 EOF
 }

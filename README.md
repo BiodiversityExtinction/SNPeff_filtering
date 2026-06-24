@@ -250,7 +250,7 @@ It:
 Useful optional arguments:
 
 - `--out`: custom output file name
-- `--snpeff-dir`: directory containing `snpEff.jar`
+- `--jar`: path to `snpEff.jar`
 - `--config`: explicit config file path
 - `--force`: overwrite existing output
 - `--skip-if-exists`: do nothing if the output already exists
@@ -260,7 +260,9 @@ Useful optional arguments:
 ```bash
 sbatch annotate_snpeff_vcf.sh \
   --vcf /path/input.polarised.vcf.gz \
-  --db-id brown_bear
+  --db-id brown_bear \
+  --jar /path/snpEff.jar \
+  --config /path/snpEff.config
 ```
 
 ### Default output
@@ -627,7 +629,7 @@ bash build_snpeff_db.sh \
   --build
 ```
 
-### 2. Annotate a VCF against that database
+### 2. Polarise a VCF if needed
 
 ```bash
 sbatch polarise_snpeff_vcf.sh \
@@ -640,7 +642,9 @@ sbatch polarise_snpeff_vcf.sh \
 ```bash
 sbatch annotate_snpeff_vcf.sh \
   --vcf /path/modern_bears.polarised.vcf.gz \
-  --db-id brown_bear
+  --db-id brown_bear \
+  --jar /path/snpEff.jar \
+  --config /path/SNPeff/snpEff.config
 ```
 
 ### 4. Make a population file
