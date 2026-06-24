@@ -1,12 +1,13 @@
 # SNPeff Load Workflow Notes
 
-This folder contains four scripts that I use together to build a `snpEff` database, annotate a VCF, summarise realised and masked genetic load, and then plot the results in a consistent way across projects.
+This folder contains five scripts that I use together to build a `snpEff` database, polarise a VCF to an outgroup-defined ancestral state, annotate that VCF, summarise realised and masked genetic load, and then plot the results in a consistent way across projects.
 
 This is not meant to be polished software documentation. It is a working note for future analyses, so the main aim is to explain clearly what each script does, what goes in, what comes out, and what assumptions are being made.
 
 ## Scripts In This Folder
 
 - `build_snpeff_db.sh`
+- `polarise_snpeff_vcf.sh`
 - `annotate_snpeff_vcf.sh`
 - `summarise_snpeff_load.sh`
 - `plot_snpeff_load.R`
@@ -16,16 +17,35 @@ This is not meant to be polished software documentation. It is a working note fo
 The workflow is:
 
 1. Prepare a `snpEff` reference database from a FASTA and GFF.
-2. Annotate a VCF with `snpEff`.
-3. Polarise variants using an outgroup and summarise load statistics from the annotated VCF.
-4. Plot per-individual load values and pairwise population `Rxy`.
+2. Polarise a VCF so the outgroup-defined ancestral allele becomes `REF`.
+3. Annotate the polarised VCF with `snpEff`.
+4. Summarise load statistics from the annotated VCF.
+5. Plot per-individual load values and pairwise population `Rxy`.
 
-The purpose of keeping these three steps separate is:
+The purpose of keeping these steps separate is:
 
 - the reference database usually only needs to be built once per reference genome
-- annotation may be repeated for multiple VCFs against the same reference
+- the polarisation step may be repeated with different outgroup definitions
+- annotation may be repeated for multiple polarised VCFs against the same reference
 - load summaries may be rerun multiple times with different outgroup definitions, population files, or uncertainty settings
 - plots may be rerun with different population files without touching the earlier steps
+
+### When to use the polarisation step
+
+This step is mainly for datasets mapped to an ingroup reference.
+
+- If the VCF was mapped to an ingroup reference, I should usually polarise first.
+- If the VCF was mapped to an outgroup reference, I can usually skip the polarisation step and go straight to `snpEff` annotation.
+
+The reason is simple:
+
+- with an ingroup reference, the reference allele is not guaranteed to be ancestral
+- with an outgroup reference, the reference allele is often a much better approximation to the ancestral state
+
+So in practice:
+
+- ingroup-mapped dataset: build -> polarise -> annotate -> summarise -> plot
+- outgroup-mapped dataset: build -> annotate -> summarise -> plot
 
 ## Software Needed
 
@@ -120,7 +140,88 @@ sequence.bin
 sequence.<contig>.bin
 ```
 
-## Step 2: Annotate A VCF
+## Step 2: Polarise A VCF
+
+Script:
+- [`polarise_snpeff_vcf.sh`](./polarise_snpeff_vcf.sh)
+
+### Why this step exists
+
+For load analyses, what I really want is a VCF where:
+
+- `REF` is the ancestral allele
+- `ALT` is the derived allele
+
+If I use the raw reference-based VCF, that assumption only holds when the reference genome already carries the ancestral state. That can bias load estimates, especially if the reference genome comes from one of the focal populations.
+
+This script fixes that for a load-only workflow by using outgroups to decide which allele is ancestral and then rewriting the VCF before running `snpEff`.
+
+### What the script does
+
+It:
+
+1. reads a VCF or VCF.GZ
+2. keeps biallelic SNPs only
+3. checks the outgroup genotypes at each site
+4. keeps a site only if all called outgroups agree on the same homozygous allele
+5. if outgroups are fixed for `ALT`, swaps `REF` and `ALT`
+6. flips all sample genotypes to match the new allele order
+7. writes a simplified VCF with `FORMAT=GT` only
+
+The simplification step is deliberate. Once a site has been flipped, many allele-dependent fields such as `AD`, `PL`, `AC`, and `AF` are no longer safe to trust unless they are recalculated. Since I only need this VCF for `snpEff` and the downstream load script, it is cleaner to keep genotypes only.
+
+### Important input arguments
+
+- `--vcf`: unannotated input VCF or VCF.GZ
+- `--groups`: two-column sample group file with `ingroup` and `outgroup`
+
+Useful optional arguments:
+
+- `--out`: custom output file name
+- `--allow-missing-outgroup`: allow missing outgroup calls, as long as all called outgroups still agree on the same homozygous allele
+- `--force`: overwrite existing output
+- `--skip-if-exists`: do nothing if the output already exists
+
+### Important limitations
+
+- this is meant for load analyses, not as a general-purpose rewritten VCF
+- it keeps biallelic SNPs only
+- indels and multiallelic sites are skipped automatically
+- it will not recover indel-based LoF classes such as `frameshift_variant`
+- after polarisation, the VCF should be re-annotated with `snpEff`
+
+So if I use this route, my LoF category becomes effectively SNP-based LoF unless I later extend the same logic to indels.
+
+### Example
+
+```bash
+sbatch polarise_snpeff_vcf.sh \
+  --vcf /path/input.vcf.gz \
+  --groups /path/Pops.txt
+```
+
+### Default output
+
+If the input is:
+
+```text
+input.vcf.gz
+```
+
+the default output will be:
+
+```text
+input.polarised.vcf.gz
+```
+
+### What to check after this step
+
+- the output VCF should exist and be bgzipped
+- `FORMAT` should now be `GT`
+- some sites may now have a different `REF` and `ALT` than in the original VCF
+- the run summary should report how many sites were kept and how many were flipped
+
+## Step 3: Annotate A VCF
 
 Script:
 - [`annotate_snpeff_vcf.sh`](./annotate_snpeff_vcf.sh)
@@ -158,7 +259,7 @@ Useful optional arguments:
 
 ```bash
 sbatch annotate_snpeff_vcf.sh \
-  --vcf /path/input.vcf.gz \
+  --vcf /path/input.polarised.vcf.gz \
   --db-id brown_bear
 ```
 
@@ -167,13 +268,13 @@ sbatch annotate_snpeff_vcf.sh \
 If the input is:
 
 ```text
-input.vcf.gz
+input.polarised.vcf.gz
 ```
 
 the default output will be:
 
 ```text
-input.anno.vcf.gz
+input.polarised.anno.vcf.gz
 ```
 
 ### What to check after this step
@@ -182,7 +283,7 @@ input.anno.vcf.gz
 - the header should contain an `ANN` definition
 - records should contain `ANN=` annotations in the `INFO` field
 
-## Step 3: Summarise Realised And Masked Load
+## Step 4: Summarise Realised And Masked Load
 
 Script:
 - [`summarise_snpeff_load.sh`](./summarise_snpeff_load.sh)
@@ -193,9 +294,10 @@ The annotated VCF still contains site-by-site information. This script turns tha
 
 The main idea is:
 
-- use outgroup individuals to define the ancestral state
-- keep only sites where all outgroups are fixed for the reference allele
-- treat the ALT allele as derived at those retained sites
+- start from the polarised and annotated VCF
+- treat `REF` as ancestral and `ALT` as derived
+- use the group file to decide which samples are ingroup and which are outgroup
+- keep only sites where the outgroups still support the ancestral state
 - count how often each ingroup individual carries derived alleles in different annotation classes
 
 ### Outgroup assumption
@@ -359,7 +461,7 @@ So each normalised metric can have:
 
 ### Important input arguments
 
-- `--vcf`: annotated VCF from step 2
+- `--vcf`: annotated VCF from step 3
 - `--groups`: ingroup/outgroup table
 
 Useful optional arguments:
@@ -374,7 +476,7 @@ Useful optional arguments:
 
 ```bash
 sbatch summarise_snpeff_load.sh \
-  --vcf /path/input.anno.vcf.gz \
+  --vcf /path/input.polarised.anno.vcf.gz \
   --groups /path/Pops.txt \
   --jackknife-bins 100
 ```
@@ -384,16 +486,16 @@ sbatch summarise_snpeff_load.sh \
 If the input is:
 
 ```text
-input.anno.vcf.gz
+input.polarised.anno.vcf.gz
 ```
 
 the default output will be:
 
 ```text
-input.anno.load_summary.tsv
+input.polarised.anno.load_summary.tsv
 ```
 
-## Step 4: Plot Individual Load And Population Rxy
+## Step 5: Plot Individual Load And Population Rxy
 
 Script:
 - [`plot_snpeff_load.R`](./plot_snpeff_load.R)
@@ -528,12 +630,20 @@ bash build_snpeff_db.sh \
 ### 2. Annotate a VCF against that database
 
 ```bash
-sbatch annotate_snpeff_vcf.sh \
+sbatch polarise_snpeff_vcf.sh \
   --vcf /path/modern_bears.vcf.gz \
+  --groups /path/Pops.txt
+```
+
+### 3. Annotate the polarised VCF against that database
+
+```bash
+sbatch annotate_snpeff_vcf.sh \
+  --vcf /path/modern_bears.polarised.vcf.gz \
   --db-id brown_bear
 ```
 
-### 3. Make a population file
+### 4. Make a population file
 
 Example:
 
@@ -546,20 +656,20 @@ SW_02_UAmap	ingroup
 SW_03_UAmap	ingroup
 ```
 
-### 4. Summarise realised and masked load
+### 5. Summarise realised and masked load
 
 ```bash
 sbatch summarise_snpeff_load.sh \
-  --vcf /path/modern_bears.anno.vcf.gz \
+  --vcf /path/modern_bears.polarised.anno.vcf.gz \
   --groups /path/Pops.txt \
   --jackknife-bins 100
 ```
 
-### 5. Plot individual load and Rxy
+### 6. Plot individual load and Rxy
 
 ```bash
 Rscript plot_snpeff_load.R \
-  --load /path/modern_bears.anno.load_summary.tsv \
+  --load /path/modern_bears.polarised.anno.load_summary.tsv \
   --groups /path/Plot_pops.txt \
   --outdir /path/load_plots \
   --prefix modern_bears
@@ -580,8 +690,9 @@ Rscript plot_snpeff_load.R \
 If I forget the order:
 
 1. build database
-2. annotate VCF
-3. prepare `Pops.txt`
-4. summarise load
-5. prepare `Plot_pops.txt`
-6. make plots
+2. prepare `Pops.txt`
+3. polarise VCF
+4. annotate VCF
+5. summarise load
+6. prepare `Plot_pops.txt`
+7. make plots
