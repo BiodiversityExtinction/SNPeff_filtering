@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=snpeff_load
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=8G
-#SBATCH --time=24:00:00
-#SBATCH --output=slurm-%j.out
 
 set -euo pipefail
 
@@ -65,7 +60,7 @@ Example groups file:
   SW_02_UAmap           ingroup
 
 Example:
-  sbatch summarize_snpeff_load.sh \
+  bash summarize_snpeff_load.sh \
     --vcf /path/sample.anno.vcf.gz \
     --groups /path/groups.tsv
 EOF

@@ -53,13 +53,15 @@ Important notes:
   - In chromosome-batch mode, a tabix index is created automatically if missing
   - When running internal chromosome batches, the script uses SLURM_CPUS_PER_TASK
     if available, otherwise it runs one batch at a time
+  - Internal batch mode writes visible batch files beside the final output so
+    progress is easier to monitor and partial work is easier to inspect
 
 Example:
-  sbatch polarise_snpeff_vcf.sh \
+  bash polarise_snpeff_vcf.sh \
     --vcf /path/input.vcf.gz \
     --groups /path/groups.tsv
 
-  sbatch --cpus-per-task=10 polarise_snpeff_vcf.sh \
+  bash polarise_snpeff_vcf.sh \
     --vcf /path/input.vcf.gz \
     --groups /path/groups.tsv \
     -c 10
@@ -254,24 +256,12 @@ fi
 
 TMP_VCF="${OUT%.gz}.tmp.vcf"
 TMP_OUT="${OUT}.tmp"
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR" "$TMP_VCF" "$TMP_OUT"' EXIT
 rm -f "$TMP_VCF" "$TMP_OUT"
 
-printf 'Polarising load VCF using outgroups\n'
-printf '  vcf    = %s\n' "$VCF"
-printf '  groups = %s\n' "$GROUPS_FILE"
-printf '  out    = %s\n' "$OUT"
-if [[ "$REGION_MODE" -eq 1 && "$INTERNAL_BATCH_MODE" -eq 0 ]]; then
-  printf '  batch  = %s of %s\n' "$((BATCH_INDEX + 1))" "$TOTAL_BATCHES"
-  printf '  chroms = %s\n' "$(IFS=,; printf '%s' "${SELECTED_CHROMS[*]}")"
-elif [[ "$INTERNAL_BATCH_MODE" -eq 1 ]]; then
-  printf '  batches = %s\n' "$TOTAL_BATCHES"
-  printf '  cpus    = %s\n' "$MAX_PARALLEL_JOBS"
-fi
-
-run_python_to_output() {
-local vcf_input="$1"
-local out_vcf="$2"
-"$PYTHON_BIN" - "$vcf_input" "$GROUPS_FILE" "$ALLOW_MISSING_OUTGROUP" > "$out_vcf" <<'PYCODE'
+PY_HELPER="${WORK_DIR}/polarise_helper.py"
+cat > "$PY_HELPER" <<'PYCODE'
 import gzip
 import sys
 from collections import Counter
@@ -303,6 +293,8 @@ def parse_groups(path):
 
 
 def open_vcf(path):
+    if path == "-":
+        return sys.stdin
     if path.endswith(".gz"):
         return gzip.open(path, "rt", encoding="utf-8")
     return open(path, "r", encoding="utf-8")
@@ -484,6 +476,23 @@ for key in [
 ]:
     print(f"  {key} = {stats.get(key, 0)}", file=sys.stderr)
 PYCODE
+
+printf 'Polarising load VCF using outgroups\n'
+printf '  vcf    = %s\n' "$VCF"
+printf '  groups = %s\n' "$GROUPS_FILE"
+printf '  out    = %s\n' "$OUT"
+if [[ "$REGION_MODE" -eq 1 && "$INTERNAL_BATCH_MODE" -eq 0 ]]; then
+  printf '  batch  = %s of %s\n' "$((BATCH_INDEX + 1))" "$TOTAL_BATCHES"
+  printf '  chroms = %s\n' "$(IFS=,; printf '%s' "${SELECTED_CHROMS[*]}")"
+elif [[ "$INTERNAL_BATCH_MODE" -eq 1 ]]; then
+  printf '  batches = %s\n' "$TOTAL_BATCHES"
+  printf '  cpus    = %s\n' "$MAX_PARALLEL_JOBS"
+fi
+
+run_python_to_output() {
+local vcf_input="$1"
+local out_vcf="$2"
+"$PYTHON_BIN" "$PY_HELPER" "$vcf_input" "$GROUPS_FILE" "$ALLOW_MISSING_OUTGROUP" > "$out_vcf"
 }
 
 process_batch() {
@@ -497,13 +506,16 @@ process_batch() {
 
   {
     printf 'Batch %s chromosomes: %s\n' "$batch_index" "$(IFS=,; printf '%s' "${batch_chroms[*]}")"
-    "$TABIX_BIN" -h "$VCF" "${batch_chroms[@]}" | run_python_to_output "-" "$batch_out"
+    "$TABIX_BIN" -h "$VCF" "${batch_chroms[@]}" | run_python_to_output "-" "${batch_out%.gz}"
+    "$BGZIP_BIN" -f -c "${batch_out%.gz}" > "$batch_out"
+    rm -f "${batch_out%.gz}"
   } >"$batch_log" 2>&1
 }
 
 if [[ "$INTERNAL_BATCH_MODE" -eq 1 ]]; then
-  TMP_DIR="$(mktemp -d)"
-  trap 'rm -rf "$TMP_DIR"' EXIT
+  BATCH_DIR="${OUT%.vcf.gz}.batches"
+  mkdir -p "$BATCH_DIR"
+  printf '  batchdir = %s\n' "$BATCH_DIR"
 
   pids=()
   batch_outputs=()
@@ -521,10 +533,15 @@ if [[ "$INTERNAL_BATCH_MODE" -eq 1 ]]; then
       batch_chroms+=("${ALL_CHROMS[$j]}")
     done
 
-    batch_out="${TMP_DIR}/batch$(printf '%03d' "$batch_i").vcf"
-    batch_log="${TMP_DIR}/batch$(printf '%03d' "$batch_i").log"
+    batch_out="${BATCH_DIR}/batch$(printf '%03d' "$batch_i").vcf.gz"
+    batch_log="${BATCH_DIR}/batch$(printf '%03d' "$batch_i").log"
     batch_outputs+=("$batch_out")
     batch_logs+=("$batch_log")
+
+    if [[ -f "$batch_out" && "$FORCE" -eq 0 ]]; then
+      printf 'Reusing existing batch output: %s\n' "$batch_out"
+      continue
+    fi
 
     process_batch "$batch_i" "$batch_out" "$batch_log" "${batch_chroms[@]}" &
     pids+=("$!")
@@ -539,27 +556,30 @@ if [[ "$INTERNAL_BATCH_MODE" -eq 1 ]]; then
     wait "$pid"
   done
 
-  : > "$TMP_VCF"
-  first_batch=1
-  for batch_file in "${batch_outputs[@]}"; do
-    if [[ "$first_batch" -eq 1 ]]; then
-      cat "$batch_file" >> "$TMP_VCF"
-      first_batch=0
-    else
-      awk '!/^#/' "$batch_file" >> "$TMP_VCF"
-    fi
+  for batch_log in "${batch_logs[@]}"; do
+    [[ -f "$batch_log" ]] && cat "$batch_log" >&2
   done
 
-  for batch_log in "${batch_logs[@]}"; do
-    cat "$batch_log" >&2
-  done
+  {
+    first_batch=1
+    for batch_file in "${batch_outputs[@]}"; do
+      if [[ "$first_batch" -eq 1 ]]; then
+        gzip -cd "$batch_file"
+        first_batch=0
+      else
+        gzip -cd "$batch_file" | awk '!/^#/'
+      fi
+    done
+  } | "$BGZIP_BIN" -c > "$TMP_OUT"
 elif [[ "$REGION_MODE" -eq 1 ]]; then
   "$TABIX_BIN" -h "$VCF" "${SELECTED_CHROMS[@]}" | run_python_to_output "-" "$TMP_VCF"
 else
   run_python_to_output "$VCF" "$TMP_VCF"
 fi
 
-"$BGZIP_BIN" -c "$TMP_VCF" > "$TMP_OUT"
+if [[ "$INTERNAL_BATCH_MODE" -eq 0 ]]; then
+  "$BGZIP_BIN" -c "$TMP_VCF" > "$TMP_OUT"
+fi
 mv "$TMP_OUT" "$OUT"
 rm -f "$TMP_VCF"
 

@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=snpeff_annotate
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=8G
-#SBATCH --time=48:00:00
-#SBATCH --output=slurm-%j.out
 
 set -euo pipefail
 
@@ -38,7 +33,7 @@ What it does:
   4. Compresses the output with bgzip
 
 Example:
-  sbatch annotate_snpeff_vcf.sh \
+  bash annotate_snpeff_vcf.sh \
     --vcf /path/sample.vcf.gz \
     --db-id brown_bear \
     --jar /path/snpEff.jar \
