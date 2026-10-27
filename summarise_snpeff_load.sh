@@ -5,7 +5,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  summarize_snpeff_load.sh --vcf FILE --groups FILE [options]
+  summarise_snpeff_load.sh --vcf FILE --groups FILE [options]
 
 Required arguments:
   --vcf FILE           Annotated VCF/VCF.GZ from snpEff
@@ -15,6 +15,9 @@ Required arguments:
 Optional arguments:
   --out FILE           Output TSV
                        Default: input with .load_summary.tsv suffix
+  --genotype-out FILE  Separate TSV of genotype-specific synonymous ratios
+                       Default: --out with .genotype_normalised.tsv replacing .tsv
+  --genotype-only      Write only the genotype-specific table (preserve existing summary)
   --python BIN         Python binary to use
                        Default: python3 from PATH
   --jackknife-bins N   Compute delete-a-group jackknife uncertainty using N gene bins
@@ -22,8 +25,8 @@ Optional arguments:
                        Default: 0 (disabled)
   --allow-missing-outgroup
                        Allow missing outgroup genotypes; all called outgroups must still be 0/0
-  --force              Overwrite output if it already exists
-  --skip-if-exists     Exit cleanly if output already exists
+  --force              Overwrite selected outputs if they already exist
+  --skip-if-exists     Exit cleanly only if all selected outputs already exist
   -h, --help           Show this help
 
 Output columns:
@@ -52,6 +55,11 @@ Notes:
   - If jackknife bins are requested, genes are ordered by first appearance in the VCF and split
     into roughly equal-sized bins. SE and 95% CI are reported for normalised metrics only,
     using estimate +/- 1.96 * SE.
+  - The separate genotype-specific table divides realised LoF/missense counts by homozygous
+    derived synonymous counts, and masked counts by heterozygous synonymous counts.
+    Both numerators and denominators are recalculated in every jackknife replicate.
+    Zero denominators produce NA; any undefined replicate makes that metric's SE/CI NA.
+    Without --jackknife-bins, uncertainty is NA in both tables.
 
 Example groups file:
   Polar_bear_UAmap      outgroup
@@ -60,7 +68,7 @@ Example groups file:
   SW_02_UAmap           ingroup
 
 Example:
-  bash summarize_snpeff_load.sh \
+  bash summarise_snpeff_load.sh \
     --vcf /path/sample.anno.vcf.gz \
     --groups /path/groups.tsv
 EOF
@@ -79,6 +87,8 @@ require_file() {
 VCF=""
 GROUPS_FILE=""
 OUT=""
+GENOTYPE_OUT=""
+GENOTYPE_ONLY=0
 PYTHON_BIN=""
 JACKKNIFE_BINS=0
 ALLOW_MISSING_OUTGROUP=0
@@ -98,6 +108,14 @@ while [[ $# -gt 0 ]]; do
     --out)
       OUT="${2:-}"
       shift 2
+      ;;
+    --genotype-out)
+      GENOTYPE_OUT="${2:-}"
+      shift 2
+      ;;
+    --genotype-only)
+      GENOTYPE_ONLY=1
+      shift
       ;;
     --python)
       PYTHON_BIN="${2:-}"
@@ -156,30 +174,53 @@ if [[ -z "$OUT" ]]; then
   esac
 fi
 
-if [[ -f "$OUT" ]]; then
-  if [[ "$SKIP_IF_EXISTS" -eq 1 && "$FORCE" -ne 1 ]]; then
-    printf 'Output already exists, skipping: %s\n' "$OUT"
-    exit 0
-  fi
-  if [[ "$FORCE" -ne 1 ]]; then
-    die "Output already exists: $OUT (use --force or --skip-if-exists)"
-  fi
+if [[ -z "$GENOTYPE_OUT" ]]; then
+  GENOTYPE_OUT="${OUT%.tsv}.genotype_normalised.tsv"
 fi
+
+# Resolve aliases before checking output collisions, including symlinked paths.
+"$PYTHON_BIN" - "$OUT" "$GENOTYPE_OUT" "$VCF" "$GROUPS_FILE" <<'PATHCHECK'
+import os
+import sys
+paths = [os.path.realpath(path) for path in sys.argv[1:]]
+if paths[0] == paths[1] or any(path in paths[2:] for path in paths[:2]):
+    raise SystemExit("Output paths must be distinct and must not overwrite either input.")
+PATHCHECK
+
+OUTPUTS=("$GENOTYPE_OUT")
+if [[ "$GENOTYPE_ONLY" -eq 0 ]]; then
+  OUTPUTS+=("$OUT")
+fi
+ALL_EXIST=1
+for output in "${OUTPUTS[@]}"; do
+  [[ -f "$output" ]] || ALL_EXIST=0
+done
+if [[ "$ALL_EXIST" -eq 1 && "$SKIP_IF_EXISTS" -eq 1 && "$FORCE" -ne 1 ]]; then
+  printf 'All selected outputs already exist, skipping.\n'
+  exit 0
+fi
+for output in "${OUTPUTS[@]}"; do
+  if [[ -e "$output" && "$FORCE" -ne 1 ]]; then
+    die "Output already exists: $output (use --force, or --genotype-only to add the new table)"
+  fi
+done
 
 printf 'Summarising realised and masked load from snpEff VCF\n'
 printf '  vcf    = %s\n' "$VCF"
 printf '  groups = %s\n' "$GROUPS_FILE"
 printf '  out    = %s\n' "$OUT"
+printf '  genotype out = %s\n' "$GENOTYPE_OUT"
+printf '  genotype only = %s\n' "$GENOTYPE_ONLY"
 printf '  bins   = %s\n' "$JACKKNIFE_BINS"
 
-"$PYTHON_BIN" - "$VCF" "$GROUPS_FILE" "$OUT" "$ALLOW_MISSING_OUTGROUP" "$JACKKNIFE_BINS" <<'PYCODE'
+"$PYTHON_BIN" - "$VCF" "$GROUPS_FILE" "$OUT" "$ALLOW_MISSING_OUTGROUP" "$JACKKNIFE_BINS" "$GENOTYPE_OUT" "$GENOTYPE_ONLY" <<'PYCODE'
 import csv
 import gzip
 import math
 import sys
 from collections import defaultdict
 
-vcf_path, groups_path, out_path, allow_missing_flag, jackknife_bins_arg = sys.argv[1:]
+vcf_path, groups_path, out_path, allow_missing_flag, jackknife_bins_arg, genotype_out_path, genotype_only_flag = sys.argv[1:]
 allow_missing_outgroup = allow_missing_flag == "1"
 requested_jackknife_bins = int(jackknife_bins_arg)
 
@@ -229,13 +270,25 @@ JACKKNIFE_METRICS = [
     "nonsynonymous_masked_over_synonymous_total",
 ]
 
-for metric in JACKKNIFE_METRICS:
-    OUTPUT_COLUMNS.extend([
-        f"{metric}_jackknife_bins",
-        f"{metric}_jackknife_se",
-        f"{metric}_jackknife_ci_lower",
-        f"{metric}_jackknife_ci_upper",
-    ])
+GENOTYPE_METRICS = {
+    f"{category}_{state}_over_synonymous_{state}": (f"{category}_{state}", f"synonymous_{state}")
+    for category in ("lof", "nonsynonymous")
+    for state in ("realised", "masked")
+}
+GENOTYPE_COLUMNS = [
+    "sample", "synonymous_realised", "synonymous_masked",
+    "lof_realised", "lof_masked", "nonsynonymous_realised", "nonsynonymous_masked",
+    *GENOTYPE_METRICS,
+]
+for columns, metrics in ((OUTPUT_COLUMNS, JACKKNIFE_METRICS), (GENOTYPE_COLUMNS, GENOTYPE_METRICS)):
+    for metric in metrics:
+        columns.extend([
+            f"{metric}_jackknife_bins",
+            f"{metric}_jackknife_se",
+            f"{metric}_jackknife_ci_lower",
+            f"{metric}_jackknife_ci_upper",
+        ])
+ALL_METRICS = [*JACKKNIFE_METRICS, *GENOTYPE_METRICS]
 
 
 def open_text(path):
@@ -474,6 +527,8 @@ def build_ratio_fields(count_dict):
         row["lof_masked_over_synonymous_total"] = "NA"
         row["nonsynonymous_realised_over_synonymous_total"] = "NA"
         row["nonsynonymous_masked_over_synonymous_total"] = "NA"
+    for metric, (numerator, denominator) in GENOTYPE_METRICS.items():
+        row[metric] = count_dict[numerator] / count_dict[denominator] if count_dict[denominator] > 0 else "NA"
     return row
 
 
@@ -500,7 +555,7 @@ def format_output_value(value):
 
 
 jackknife_results = {
-    sample: {metric: None for metric in JACKKNIFE_METRICS}
+    sample: {metric: None for metric in ALL_METRICS}
     for sample in ingroup_names
 }
 
@@ -522,11 +577,11 @@ if requested_jackknife_bins > 0 and gene_order:
 
     for sample in ingroup_names:
         theta_hat = build_ratio_fields(counts[sample])
-        metric_values = {metric: [] for metric in JACKKNIFE_METRICS}
+        metric_values = {metric: [] for metric in ALL_METRICS}
         for bin_idx in range(jackknife_bins_used):
             reduced_counts = subtract_counts(counts[sample], bin_counts[bin_idx][sample])
             reduced_ratios = build_ratio_fields(reduced_counts)
-            for metric in JACKKNIFE_METRICS:
+            for metric in ALL_METRICS:
                 value = reduced_ratios[metric]
                 if value == "NA":
                     metric_values[metric] = None
@@ -534,7 +589,7 @@ if requested_jackknife_bins > 0 and gene_order:
                 if metric_values[metric] is not None:
                     metric_values[metric].append(value)
 
-        for metric in JACKKNIFE_METRICS:
+        for metric in ALL_METRICS:
             values = metric_values[metric]
             theta = theta_hat[metric]
             if theta == "NA" or not values or len(values) < 2:
@@ -549,27 +604,34 @@ if requested_jackknife_bins > 0 and gene_order:
                 "ci_upper": theta + 1.96 * se,
             }
 
-with open(out_path, "wt", newline="") as out_handle:
-    writer = csv.DictWriter(out_handle, fieldnames=OUTPUT_COLUMNS, delimiter="\t")
-    writer.writeheader()
-    for sample in ingroup_names:
-        row = {"sample": sample}
-        row.update(counts[sample])
-        row.update(build_ratio_fields(counts[sample]))
-        for metric in JACKKNIFE_METRICS:
-            result = jackknife_results[sample][metric]
-            if result is None:
-                row[f"{metric}_jackknife_bins"] = jackknife_bins_used if jackknife_bins_used > 0 else "NA"
-                row[f"{metric}_jackknife_se"] = "NA"
-                row[f"{metric}_jackknife_ci_lower"] = "NA"
-                row[f"{metric}_jackknife_ci_upper"] = "NA"
-            else:
-                row[f"{metric}_jackknife_bins"] = result["bins"]
-                row[f"{metric}_jackknife_se"] = result["se"]
-                row[f"{metric}_jackknife_ci_lower"] = result["ci_lower"]
-                row[f"{metric}_jackknife_ci_upper"] = result["ci_upper"]
-        formatted_row = {key: format_output_value(value) for key, value in row.items()}
-        writer.writerow(formatted_row)
+def write_table(path, columns, metrics):
+    with open(path, "wt", newline="") as out_handle:
+        writer = csv.DictWriter(out_handle, fieldnames=columns, delimiter="\t")
+        writer.writeheader()
+        for sample in ingroup_names:
+            row = {"sample": sample}
+            row.update(counts[sample])
+            row.update(build_ratio_fields(counts[sample]))
+            for metric in metrics:
+                result = jackknife_results[sample][metric]
+                if result is None:
+                    row[f"{metric}_jackknife_bins"] = jackknife_bins_used if jackknife_bins_used > 0 else "NA"
+                    row[f"{metric}_jackknife_se"] = "NA"
+                    row[f"{metric}_jackknife_ci_lower"] = "NA"
+                    row[f"{metric}_jackknife_ci_upper"] = "NA"
+                else:
+                    row[f"{metric}_jackknife_bins"] = result["bins"]
+                    row[f"{metric}_jackknife_se"] = result["se"]
+                    row[f"{metric}_jackknife_ci_lower"] = result["ci_lower"]
+                    row[f"{metric}_jackknife_ci_upper"] = result["ci_upper"]
+            formatted_row = {key: format_output_value(row[key]) for key in columns}
+            writer.writerow(formatted_row)
+
+if genotype_only_flag != "1":
+    write_table(out_path, OUTPUT_COLUMNS, JACKKNIFE_METRICS)
+write_table(genotype_out_path, GENOTYPE_COLUMNS, GENOTYPE_METRICS)
 PYCODE
 
-printf 'Finished: %s\n' "$OUT"
+for output in "${OUTPUTS[@]}"; do
+  printf 'Finished: %s\n' "$output"
+done

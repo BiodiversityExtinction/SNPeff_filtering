@@ -1,8 +1,55 @@
 # SNPeff Load Workflow Notes
 
-This folder contains five scripts that I use together to build a `snpEff` database, polarise a VCF to an outgroup-defined ancestral state, annotate that VCF, summarise realised and masked genetic load, and then plot the results in a consistent way across projects.
+This folder contains five core scripts that I use together to build a `snpEff` database, polarise a VCF to an outgroup-defined ancestral state, annotate that VCF, summarise realised and masked genetic load, and then plot the results in a consistent way across projects. An optional FreeBayes example shows one way to generate the input VCF.
 
 This is not meant to be polished software documentation. It is a working note for future analyses, so the main aim is to explain clearly what each script does, what goes in, what comes out, and what assumptions are being made.
+
+## Example: Make An Input VCF
+
+[`examples/freebayes_scaffold_array_template.sh`](./examples/freebayes_scaffold_array_template.sh)
+shows one way to call variants before starting the `snpEff` workflow. It is an
+example of an upstream calling pipeline, not a required part of the load scripts.
+It uses FreeBayes on a BAM list, with one Slurm array task per BED file, then
+normalises and filters the calls with BCFtools. The output is one indexed,
+compressed VCF per BED region. The example assumes Slurm, FreeBayes, BCFtools
+and tabix are available.
+
+Prepare a FASTA reference with an index, indexed BAM files, a text file listing
+one BAM path per line, and non-overlapping BED files for the regions to call.
+Each BED filename becomes its output VCF basename, so filenames must be unique.
+From the directory where you will run `sbatch`, create `logs/` **before**
+submission: Slurm opens its output files before the script can create directories.
+Set `REF`, `BAMLIST`, `BEDDIR` and `OUTDIR` to your own paths and export them so
+the array tasks can read them. If `FREEBAYES` is unset, the script uses
+`freebayes` from `PATH`.
+
+For example, from the repository root:
+
+```bash
+export REF=/path/reference.fa
+export BAMLIST=/path/samples.bamlist
+export BEDDIR=/path/scaffold_beds
+export OUTDIR=/path/scaffold_vcfs
+mkdir -p logs "$OUTDIR"
+mapfile -t beds < <(find "$BEDDIR" -maxdepth 1 -type f -name '*.bed' | sort)
+# Confirm that the BED list is non-empty before submitting.
+sbatch --array="0-$((${#beds[@]} - 1))" examples/freebayes_scaffold_array_template.sh
+```
+
+The example requires mapping quality at least 20, base quality at least 20 and
+an alternate allele fraction of at least 0.25. It keeps biallelic SNPs with
+`QUAL > 30`. These settings are **example choices**, not universal thresholds;
+record the values actually used for each study. SNP-only output excludes indels
+and therefore frameshift indels from downstream LoF counts. This script does
+not remove sites with missing genotypes. If that is required, do it explicitly
+after combining the VCFs, and record that filtering step in the methods.
+
+After the array finishes, combine the VCFs in genomic coordinate order, check
+that regions do not overlap or duplicate sites, and index the combined VCF.
+Use that combined VCF as input to polarisation (if needed) and subsequent
+annotation. The exact combination and missing-data filtering steps depend on
+how the BED regions and samples were prepared; they are not done by the example
+script. Use the same reference FASTA for calling and for the `snpEff` database.
 
 ## Scripts In This Folder
 
@@ -461,6 +508,49 @@ The main normalised columns are:
 
 Floating-point values are written to 6 decimal places.
 
+### Separate genotype-specific normalisation table
+
+Each run also writes `input.anno.load_summary.genotype_normalised.tsv`. The
+original summary keeps its shared `synonymous_total` denominator. The additional
+table uses the synonymous count for the same genotype state as its numerator:
+
+| Column | Calculation |
+| --- | --- |
+| `lof_realised_over_synonymous_realised` | Homozygous derived LoF / homozygous derived synonymous |
+| `lof_masked_over_synonymous_masked` | Heterozygous LoF / heterozygous synonymous |
+| `nonsynonymous_realised_over_synonymous_realised` | Homozygous derived missense / homozygous derived synonymous |
+| `nonsynonymous_masked_over_synonymous_masked` | Heterozygous missense / heterozygous synonymous |
+
+The table includes `sample` and all six underlying counts, so the denominators
+and the ratios can be checked. Homozygous synonymous here means **homozygous
+derived**, not homozygous reference. There is no 0.5 weighting in these ratios:
+both numerator and denominator count the same genotype state. Variant
+classification, outgroup filtering and sample inclusion are identical for the
+two tables. Numbers use British spelling and six decimal places.
+
+These additional ratios describe predicted damaging variation relative to
+synonymous variation within each genotype state. They help examine whether a
+population difference tracks background heterozygosity or homozygosity, but they
+do not measure the absolute number of damaging genotypes. For example, 100
+heterozygous LoF variants / 10,000 heterozygous synonymous variants and 200 /
+20,000 give the same ratio despite different burdens. Use both tables and the
+raw counts when interpreting differences; neither normalisation removes all
+effects of demography, callability or annotation quality.
+
+With `--jackknife-bins N`, the new table includes SE and 95% CI columns for all
+four ratios. The script uses the **same bins** for both tables and recalculates
+both numerator and denominator after each bin is omitted. The new intervals
+cannot be recovered from the old summary's SEs/CIs alone: rerun the annotated
+VCF to calculate them.
+
+A zero denominator gives `NA`. If any leave-one-bin-out denominator is zero, the
+full-data ratio is still reported when defined, but its SE and CI are `NA`.
+Uncertainty is also `NA` when jackknifing is disabled or fewer than two bins are
+available. `_jackknife_bins` records the number of bins used/attempted, so read it
+together with the SE/CI fields. Zero observed numerator counts can produce zero
+SE and a zero-width interval; this does not establish that the underlying burden
+is certainly zero. Normal-approximation CI bounds are not clipped at zero.
+
 ### Jackknife uncertainty
 
 If `--jackknife-bins N` is provided, the script also estimates uncertainty.
@@ -469,12 +559,16 @@ The logic is:
 
 1. genes are tracked from the `ANN` field
 2. genes are ordered by first appearance in the VCF
-3. those genes are split into approximately equal-sized bins
+3. genes are assigned round-robin to approximately equal-sized bins (gene index modulo bin count)
 4. one bin is left out at a time
 5. the normalised load metrics are recalculated
 6. jackknife SE and 95% CI are calculated from those replicate values
 
-This means the uncertainty is based on groups of genes rather than on individual sites.
+Variants assigned to the same gene stay together. If an annotation has no gene
+identifier/name, the script uses chromosome, position and ALT as a fallback unit.
+These bins are not contiguous genomic windows and do not necessarily preserve
+linkage between neighbouring genes. The intervals describe variation across the
+chosen bins; they do not include uncertainty from genotype errors or annotation.
 
 That is useful because:
 
@@ -502,10 +596,14 @@ So each normalised metric can have:
 Useful optional arguments:
 
 - `--out`: output file name
+- `--genotype-out`: name for the separate genotype-specific table; defaults to
+  `--out` with `.tsv` replaced by `.genotype_normalised.tsv`
+- `--genotype-only`: write only the genotype-specific table, preserving any existing summary
 - `--jackknife-bins N`: add uncertainty using `N` gene bins
 - `--allow-missing-outgroup`: allow missing outgroup calls
-- `--force`: overwrite existing output
-- `--skip-if-exists`: do nothing if the output already exists
+- `--force`: overwrite selected outputs
+- `--skip-if-exists`: do nothing only if all selected outputs already exist;
+  a partially existing pair requires `--genotype-only` or `--force`
 
 ### Example
 
@@ -528,7 +626,23 @@ the default output will be:
 
 ```text
 input.polarised.anno.load_summary.tsv
+input.polarised.anno.load_summary.genotype_normalised.tsv
 ```
+
+To add the new table to a completed analysis with 100 jackknife bins:
+
+```bash
+bash summarise_snpeff_load.sh \
+  --vcf /path/input.polarised.anno.vcf.gz \
+  --groups /path/Pops.txt \
+  --jackknife-bins 100 \
+  --genotype-only
+```
+
+If the original summary used a custom `--out`, supply that same `--out` to derive
+the matching companion filename, or specify `--genotype-out` explicitly. The
+plotting script currently reads the original shared-denominator summary; the new
+table is a separate analysis output.
 
 ## Step 5: Plot Individual Load And Population Rxy
 
