@@ -22,6 +22,8 @@ Optional arguments:
                        Default: java from PATH
   --bgzip BIN          bgzip binary to use
                        Default: bgzip from PATH
+  --bcftools BIN       bcftools binary for REF validation on polarised VCFs
+                       Default: bcftools from PATH
   --force              Overwrite output if it already exists
   --skip-if-exists     Exit cleanly if output already exists
   -h, --help           Show this help
@@ -29,8 +31,8 @@ Optional arguments:
 What it does:
   1. Checks that the input VCF, snpEff jar, and config file exist
   2. Verifies that the requested database is present in the config
-  3. Runs snpEff annotation
-  4. Compresses the output with bgzip
+  3. For polarised VCFs, checks every REF against this database's sequences.fa
+  4. Runs snpEff annotation and compresses the result with bgzip
 
 Example:
   bash annotate_snpeff_vcf.sh \
@@ -58,6 +60,7 @@ SNPEFF_JAR=""
 CONFIG=""
 JAVA_BIN=""
 BGZIP_BIN=""
+BCFTOOLS_BIN=""
 FORCE=0
 SKIP_IF_EXISTS=0
 
@@ -89,6 +92,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --bgzip)
       BGZIP_BIN="${2:-}"
+      shift 2
+      ;;
+    --bcftools)
+      BCFTOOLS_BIN="${2:-}"
       shift 2
       ;;
     --force)
@@ -135,6 +142,23 @@ if ! grep -q "^${DB_ID}\.genome[[:space:]]*:" "$CONFIG"; then
   die "Database ID '${DB_ID}' not found in config: $CONFIG"
 fi
 
+if [[ -z "$BCFTOOLS_BIN" ]]; then
+  BCFTOOLS_BIN="$(command -v bcftools || true)"
+fi
+[[ -n "$BCFTOOLS_BIN" && -x "$BCFTOOLS_BIN" ]] || die "bcftools is required to check whether the VCF was polarised"
+
+HEADER_TMP="$(mktemp)"
+trap 'rm -f "$HEADER_TMP"' EXIT
+"$BCFTOOLS_BIN" view -h "$VCF" > "$HEADER_TMP" || die "Could not read VCF header: $VCF"
+
+if grep -q '^##polarise_snpeff_vcf=' "$HEADER_TMP"; then
+  DB_FASTA="$(dirname "$CONFIG")/data/${DB_ID}/sequences.fa"
+  [[ -f "$DB_FASTA" ]] || die "Polarised VCF requires database FASTA at $DB_FASTA"
+  [[ -f "$(dirname "$CONFIG")/data/${DB_ID}/snpEffectPredictor.bin" ]] || die "Polarised VCF requires a built database for $DB_ID"
+  printf 'Checking polarised VCF REF against database FASTA: %s\n' "$DB_FASTA"
+  "$BCFTOOLS_BIN" norm --check-ref e --fasta-ref "$DB_FASTA" -Ou "$VCF" > /dev/null || die "VCF REF does not match snpEff database FASTA; rebuild the database from the ancestral FASTA"
+fi
+
 if [[ -z "$OUT" ]]; then
   case "$VCF" in
     *.vcf.gz)
@@ -160,6 +184,7 @@ if [[ -f "$OUT" ]]; then
 fi
 
 TMP_OUT="${OUT}.tmp"
+trap 'rm -f "$HEADER_TMP" "$TMP_OUT"' EXIT
 rm -f "$TMP_OUT"
 
 printf 'Annotating VCF with snpEff\n'
@@ -168,7 +193,7 @@ printf '  output = %s\n' "$OUT"
 printf '  db     = %s\n' "$DB_ID"
 printf '  config = %s\n' "$CONFIG"
 
-"$JAVA_BIN" -jar "$SNPEFF_JAR" -v "$DB_ID" -c "$CONFIG" "$VCF" | "$BGZIP_BIN" -c > "$TMP_OUT"
+"$JAVA_BIN" -jar "$SNPEFF_JAR" -v -noStats "$DB_ID" -c "$CONFIG" "$VCF" | "$BGZIP_BIN" -c > "$TMP_OUT"
 mv "$TMP_OUT" "$OUT"
 
 printf 'Finished: %s\n' "$OUT"

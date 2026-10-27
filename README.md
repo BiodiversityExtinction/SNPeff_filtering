@@ -1,6 +1,6 @@
 # SNPeff Load Workflow Notes
 
-This folder contains five core scripts that I use together to build a `snpEff` database, polarise a VCF to an outgroup-defined ancestral state, annotate that VCF, summarise realised and masked genetic load, and then plot the results in a consistent way across projects. An optional FreeBayes example shows one way to generate the input VCF.
+This folder contains six core steps that I use together to polarise a VCF, make a matching ancestral FASTA, build a `snpEff` database, annotate variants, summarise realised and masked genetic load, and plot the results. A single-command runner covers the first five steps. An optional FreeBayes example shows one way to generate the input VCF.
 
 This is not meant to be polished software documentation. It is a working note for future analyses, so the main aim is to explain clearly what each script does, what goes in, what comes out, and what assumptions are being made.
 
@@ -49,40 +49,77 @@ that regions do not overlap or duplicate sites, and index the combined VCF.
 Use that combined VCF as input to polarisation (if needed) and subsequent
 annotation. The exact combination and missing-data filtering steps depend on
 how the BED regions and samples were prepared; they are not done by the example
-script. Use the same reference FASTA for calling and for the `snpEff` database.
+script. Use the calling reference for an unpolarised analysis. For a polarised
+analysis, build a **new** `snpEff` database from the ancestral FASTA below.
 
 ## Scripts In This Folder
 
 - `build_snpeff_db.sh`
 - `polarise_snpeff_vcf.sh`
+- `prepare_snpeff_ancestral_fasta.sh`
 - `annotate_snpeff_vcf.sh`
 - `summarise_snpeff_load.sh`
 - `plot_snpeff_load.R`
+- `run_ancestral_snpeff_load.sh` (the first five steps in one command)
 
 ## Overall Logic
 
 The workflow is:
 
-1. Prepare a `snpEff` reference database from a FASTA and GFF.
-2. Polarise a VCF so the outgroup-defined ancestral allele becomes `REF`.
-3. Annotate the polarised VCF with `snpEff`.
-4. Summarise load statistics from the annotated VCF.
-5. Plot per-individual load values and pairwise population `Rxy`.
+1. Polarise the VCF so the outgroup-defined ancestral allele becomes `REF`.
+2. Apply the companion patch VCF to the original FASTA to make an ancestral FASTA.
+3. Build a **new** `snpEff` database from that FASTA and the original GFF.
+4. Annotate the polarised VCF against the new database.
+5. Summarise load statistics from the annotated VCF.
+6. Plot per-individual load values and pairwise population `Rxy`.
+
+**Do not annotate a flipped VCF against a database built from the original
+genome.** At flipped sites, snpEff can misclassify a damaging substitution as
+synonymous. Previously generated polarised annotations and load summaries made
+that way must be rerun from the original VCF; changing only the summary cannot
+repair them.
 
 The purpose of keeping these steps separate is:
 
-- the reference database usually only needs to be built once per reference genome
+- an ancestral database needs rebuilding when the outgroup-defined patch set changes
 - the polarisation step may be repeated with different outgroup definitions
-- annotation may be repeated for multiple polarised VCFs against the same reference
+- annotation may be repeated only when VCF REF agrees with the database FASTA
 - load summaries may be rerun multiple times with different outgroup definitions, population files, or uncertainty settings
 - plots may be rerun with different population files without touching the earlier steps
+
+For an ingroup-mapped dataset, `run_ancestral_snpeff_load.sh` runs the first
+five steps in that order. Give it a **new** `--db-id`; it will not overwrite an
+existing database or output. For a dataset already mapped to an outgroup, use
+the individual scripts instead if choosing to skip polarisation.
+
+```bash
+bash run_ancestral_snpeff_load.sh \
+  --vcf /path/input.vcf.gz \
+  --groups /path/Pops.txt \
+  --fasta /path/original_reference.fa \
+  --gff /path/genes.gff3.gz \
+  --outdir /path/SNPeff \
+  --db-id study_ancestral \
+  --jar /path/snpEff.jar \
+  --config-template /path/snpEff.config \
+  --workdir /path/load_results \
+  --jackknife-bins 100
+```
+
+Add `-c 10` to process ten chromosomes per internal polarisation batch. In a
+Slurm job, the number of simultaneous batches follows `SLURM_CPUS_PER_TASK`.
+The `--fasta` must contain **every contig in the VCF** and correspond to the
+reference used to call variants. An autosome-only subset is fine when the VCF
+also contains only those autosomes. This runner has no embedded Slurm options;
+request the required CPUs, memory and time when submitting it.
 
 ### When to use the polarisation step
 
 This step is mainly for datasets mapped to an ingroup reference.
 
 - If the VCF was mapped to an ingroup reference, I should usually polarise first.
-- If the VCF was mapped to an outgroup reference, I can usually skip the polarisation step and go straight to `snpEff` annotation.
+- If the VCF was mapped to an outgroup reference, I can skip polarisation if I
+  accept dropping sites where outgroups indicate the reference allele is derived.
 
 The reason is simple:
 
@@ -91,7 +128,7 @@ The reason is simple:
 
 So in practice:
 
-- ingroup-mapped dataset: build -> polarise -> annotate -> summarise -> plot
+- ingroup-mapped dataset: polarise -> ancestral FASTA -> new build -> annotate -> summarise -> plot
 - outgroup-mapped dataset: build -> annotate -> summarise -> plot
 
 ## Software Needed
@@ -102,92 +139,13 @@ These scripts assume the following are available:
 - `java`
 - `python3`
 - `bgzip`
+- `bcftools` (`bcftools consensus` and `bcftools norm`)
 - `snpEff.jar`
 - a `snpEff.config` file
 
 They were written for HPC use and can be submitted with `sbatch`, but they also run directly with `bash`.
 
-## Step 1: Build The SNPeff Database
-
-Script:
-- [`build_snpeff_db.sh`](./build_snpeff_db.sh)
-
-### Why this step exists
-
-`snpEff` needs a database directory with a very specific structure. In particular, it expects:
-
-- a FASTA called `sequences.fa`
-- a GFF called `genes.gff`
-- both placed under `data/<db-id>/`
-- an entry for the database in `snpEff.config`
-
-This script prepares those files in a reproducible way.
-
-### What the script does
-
-Given a reference FASTA and a GFF/GFF3 file, it:
-
-1. creates `OUTDIR/data/<db-id>/`
-2. creates `sequences.fa` as a symlink to the input FASTA
-3. filters the GFF so that only sequence IDs found in the FASTA are retained
-4. writes that filtered annotation as `genes.gff`
-5. adds `<db-id>.genome : <genome-name>` to `snpEff.config` if the entry is missing
-6. optionally runs `snpEff build`
-
-The filtering step matters because `snpEff` is happier when the annotation and FASTA sequence names are perfectly aligned.
-
-### Important input arguments
-
-- `--fasta`: reference FASTA
-- `--gff`: annotation GFF or GFF3, gzipped or plain text
-- `--outdir`: root `snpEff` directory
-- `--db-id`: short database ID used by `snpEff`
-
-Useful optional arguments:
-
-- `--genome-name`: display name in the config
-- `--config-template`: template `snpEff.config` to copy if one does not exist yet
-- `--jar`: path to `snpEff.jar`
-- `--build`: actually run the build after preparing the files
-- `--force`: overwrite prepared files
-- `--skip-build-if-done`: skip rebuilding if the database already exists
-
-### Example
-
-```bash
-bash build_snpeff_db.sh \
-  --fasta /path/reference.fna \
-  --gff /path/reference.gff.gz \
-  --outdir /path/SNPeff \
-  --db-id brown_bear \
-  --genome-name Brown_bear \
-  --config-template /path/snpEff.config \
-  --jar /path/snpEff.jar \
-  --build
-```
-
-### What should exist after this step
-
-At minimum:
-
-```text
-SNPeff/
-  snpEff.config
-  data/
-    brown_bear/
-      sequences.fa
-      genes.gff
-```
-
-If `--build` was used successfully, the database directory should also contain binary `snpEff` build files such as:
-
-```text
-snpEffectPredictor.bin
-sequence.bin
-sequence.<contig>.bin
-```
-
-## Step 2: Polarise A VCF
+## Step 1: Polarise A VCF
 
 Script:
 - [`polarise_snpeff_vcf.sh`](./polarise_snpeff_vcf.sh)
@@ -201,7 +159,9 @@ For load analyses, what I really want is a VCF where:
 
 If I use the raw reference-based VCF, that assumption only holds when the reference genome already carries the ancestral state. That can bias load estimates, especially if the reference genome comes from one of the focal populations.
 
-This script fixes that for a load-only workflow by using outgroups to decide which allele is ancestral and then rewriting the VCF before running `snpEff`.
+This script uses outgroups to decide which allele is ancestral. The polarised
+VCF is **not yet suitable for snpEff** until a matching FASTA and database have
+been made.
 
 ### What the script does
 
@@ -214,6 +174,8 @@ It:
 5. if outgroups are fixed for `ALT`, swaps `REF` and `ALT`
 6. flips all sample genotypes to match the new allele order
 7. writes a simplified VCF with `FORMAT=GT` only
+8. writes a companion patch VCF containing flipped sites with original-genome
+   `REF` and outgroup-inferred ancestral `ALT`
 
 The simplification step is deliberate. Once a site has been flipped, many allele-dependent fields such as `AD`, `PL`, `AC`, and `AF` are no longer safe to trust unless they are recalculated. Since I only need this VCF for `snpEff` and the downstream load script, it is cleaner to keep genotypes only.
 
@@ -257,6 +219,7 @@ These are different settings. One controls parallelism, the other controls batch
 Useful optional arguments:
 
 - `--out`: custom output file name
+- `--ancestral-patches`: custom path for the companion patch VCF
 - `-c N`: process chromosomes in internal batches of `N` at a time
 - `--allow-missing-outgroup`: allow missing outgroup calls, as long as all called outgroups still agree on the same homozygous allele
 - `--force`: overwrite existing output
@@ -268,7 +231,7 @@ Useful optional arguments:
 - it keeps biallelic SNPs only
 - indels and multiallelic sites are skipped automatically
 - it will not recover indel-based LoF classes such as `frameshift_variant`
-- after polarisation, the VCF should be re-annotated with `snpEff`
+- after polarisation, first build a matching ancestral FASTA and snpEff database
 
 So if I use this route, my LoF category becomes effectively SNP-based LoF unless I later extend the same logic to indels.
 
@@ -292,6 +255,7 @@ the default output will be:
 
 ```text
 input.polarised.vcf.gz
+input.polarised.ancestral_patches.vcf.gz
 ```
 
 ### What to check after this step
@@ -301,7 +265,68 @@ input.polarised.vcf.gz
 - some sites may now have a different `REF` and `ALT` than in the original VCF
 - the run summary should report how many sites were kept and how many were flipped
 
-## Step 3: Annotate A VCF
+## Step 2: Make The Ancestral FASTA
+
+Script:
+- [`prepare_snpeff_ancestral_fasta.sh`](./prepare_snpeff_ancestral_fasta.sh)
+
+The patch VCF is in **original-reference orientation**: REF matches the
+original genome, while ALT is the agreed ancestral base. `bcftools consensus`
+applies those ALT bases to a copy of the original genome. Do **not** give it the
+polarised VCF, whose REF is already ancestral. The script streams the FASTA and
+creates a CSI index for the patch VCF if needed. It checks patch REF against
+the original genome and every polarised VCF REF against the resulting ancestral
+FASTA. A mismatch stops the run.
+
+```bash
+bash prepare_snpeff_ancestral_fasta.sh \
+  --fasta /path/reference.fa \
+  --patches /path/input.polarised.ancestral_patches.vcf.gz \
+  --polarised-vcf /path/input.polarised.vcf.gz \
+  --out /path/reference.ancestral.fa
+```
+
+Use this FASTA in the database build below. SNP substitutions leave coordinates
+unchanged, so the original GFF still fits. This is a SNP-only analysis, so
+frameshift indels are excluded. Keep the original FASTA and database for other
+analyses; do not overwrite them.
+
+This FASTA is a site-wise computational reference for effect prediction, not a
+reconstructed ancestral genome and not a reference for remapping reads. The
+outgroups' agreeing allele is an ancestry proxy; shared derived states or
+incomplete lineage sorting can still mispolarise individual sites.
+
+## Step 3: Build The SNPeff Database
+
+Script:
+- [`build_snpeff_db.sh`](./build_snpeff_db.sh)
+
+`snpEff` needs `data/<db-id>/sequences.fa`, `data/<db-id>/genes.gff`, and a
+matching entry in `snpEff.config`. The script creates the directory, links
+`sequences.fa` to the **ancestral FASTA**, filters the original GFF to contigs
+present in that FASTA, and adds the config entry. `--build` then runs snpEff's
+GFF3 database build. A new `--db-id` is essential: the old database still
+represents the original, unpolarised genome.
+
+```bash
+bash build_snpeff_db.sh \
+  --fasta /path/reference.ancestral.fa \
+  --gff /path/reference.gff.gz \
+  --outdir /path/SNPeff \
+  --db-id brown_bear_ancestral \
+  --genome-name Brown_bear_ancestral \
+  --config-template /path/snpEff.config \
+  --jar /path/snpEff.jar \
+  --build
+```
+
+The `--config-template` is only needed if `OUTDIR/snpEff.config` does not yet
+exist. After a successful build, check for
+`OUTDIR/data/<db-id>/snpEffectPredictor.bin`. Do not use
+`--skip-build-if-done` to reuse a database after changing the ancestral FASTA;
+use a new ID and rebuild it.
+
+## Step 4: Annotate A VCF
 
 Script:
 - [`annotate_snpeff_vcf.sh`](./annotate_snpeff_vcf.sh)
@@ -319,8 +344,9 @@ It:
 1. checks that the input VCF exists
 2. checks that `snpEff.jar` and the config file exist
 3. checks that the requested database ID is present in the config
-4. runs `snpEff`
-5. compresses the result with `bgzip`
+4. for a polarised VCF, checks every REF against the built database's
+   `sequences.fa`, stopping on any mismatch
+5. runs `snpEff` and compresses the result with `bgzip`
 
 ### Important input arguments
 
@@ -340,7 +366,7 @@ Useful optional arguments:
 ```bash
 sbatch annotate_snpeff_vcf.sh \
   --vcf /path/input.polarised.vcf.gz \
-  --db-id brown_bear \
+  --db-id brown_bear_ancestral \
   --jar /path/snpEff.jar \
   --config /path/snpEff.config
 ```
@@ -365,7 +391,7 @@ input.polarised.anno.vcf.gz
 - the header should contain an `ANN` definition
 - records should contain `ANN=` annotations in the `INFO` field
 
-## Step 4: Summarise Realised And Masked Load
+## Step 5: Summarise Realised And Masked Load
 
 Script:
 - [`summarise_snpeff_load.sh`](./summarise_snpeff_load.sh)
@@ -644,7 +670,7 @@ the matching companion filename, or specify `--genotype-out` explicitly. The
 plotting script currently reads the original shared-denominator summary; the new
 table is a separate analysis output.
 
-## Step 5: Plot Individual Load And Population Rxy
+## Step 6: Plot Individual Load And Population Rxy
 
 Script:
 - [`plot_snpeff_load.R`](./plot_snpeff_load.R)
@@ -763,38 +789,48 @@ Rscript plot_snpeff_load.R \
 
 ## End-To-End Example
 
-### 1. Build the database once for a reference
+### 1. Polarise the input VCF
+
+```bash
+bash polarise_snpeff_vcf.sh \
+  --vcf /path/modern_bears.vcf.gz \
+  --groups /path/Pops.txt
+```
+
+### 2. Make the ancestral FASTA from the companion patch VCF
+
+```bash
+bash prepare_snpeff_ancestral_fasta.sh \
+  --fasta /path/reference.fa \
+  --patches /path/modern_bears.polarised.ancestral_patches.vcf.gz \
+  --polarised-vcf /path/modern_bears.polarised.vcf.gz \
+  --out /path/reference.ancestral.fa
+```
+
+### 3. Build a new database using the ancestral FASTA and original GFF
 
 ```bash
 bash build_snpeff_db.sh \
-  --fasta /path/reference.fna \
+  --fasta /path/reference.ancestral.fa \
   --gff /path/reference.gff.gz \
   --outdir /path/SNPeff \
-  --db-id brown_bear \
+  --db-id brown_bear_ancestral \
   --config-template /path/snpEff.config \
   --jar /path/snpEff.jar \
   --build
 ```
 
-### 2. Polarise a VCF if needed
-
-```bash
-sbatch polarise_snpeff_vcf.sh \
-  --vcf /path/modern_bears.vcf.gz \
-  --groups /path/Pops.txt
-```
-
-### 3. Annotate the polarised VCF against that database
+### 4. Annotate the polarised VCF against that new database
 
 ```bash
 sbatch annotate_snpeff_vcf.sh \
   --vcf /path/modern_bears.polarised.vcf.gz \
-  --db-id brown_bear \
+  --db-id brown_bear_ancestral \
   --jar /path/snpEff.jar \
   --config /path/SNPeff/snpEff.config
 ```
 
-### 4. Make a population file
+### 5. Make a population file
 
 Example:
 
@@ -807,7 +843,7 @@ SW_02_UAmap	ingroup
 SW_03_UAmap	ingroup
 ```
 
-### 5. Summarise realised and masked load
+### 6. Summarise realised and masked load
 
 ```bash
 sbatch summarise_snpeff_load.sh \
@@ -816,7 +852,7 @@ sbatch summarise_snpeff_load.sh \
   --jackknife-bins 100
 ```
 
-### 6. Plot individual load and Rxy
+### 7. Plot individual load and Rxy
 
 ```bash
 Rscript plot_snpeff_load.R \
@@ -828,7 +864,7 @@ Rscript plot_snpeff_load.R \
 
 ## Practical Notes For Future Use
 
-- The database build usually only needs to be done once per reference genome.
+- A polarised database must be rebuilt when its ancestral patch set changes.
 - If a script says the output already exists, either use `--force` or provide a new `--out` file name.
 - If I want to preserve earlier versions of an output table, it is usually cleaner to give a new `--out` path rather than overwriting.
 - The load summary table only includes ingroup samples. Outgroup samples are used for filtering but are not reported as rows.

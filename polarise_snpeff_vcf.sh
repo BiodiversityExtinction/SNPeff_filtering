@@ -15,6 +15,9 @@ Required arguments:
 Optional arguments:
   --out FILE           Output polarised VCF.GZ
                        Default: input with .polarised.vcf.gz suffix
+  --ancestral-patches FILE
+                       Original-reference-orientation VCF.GZ of sites to change
+                       in the FASTA (default: OUT with .ancestral_patches.vcf.gz)
   --python BIN         Python binary to use
                        Default: python3 from PATH
   --bgzip BIN          bgzip binary to use
@@ -40,7 +43,8 @@ What it does:
   2. Uses outgroup samples to infer the ancestral allele at each site
   3. Keeps only sites where all called outgroups agree on the same homozygous allele
   4. If the ancestral allele is ALT, swaps REF and ALT and flips all genotypes
-  5. Writes a simplified load-only VCF with FORMAT=GT
+  5. Writes a simplified load-only VCF with FORMAT=GT and a companion VCF
+     containing only flipped sites in original REF -> ancestral ALT orientation
   6. Optionally splits chromosomes into internal batches and runs them in parallel
      using the CPUs allocated to the job
 
@@ -49,7 +53,8 @@ Important notes:
   - Indels and multiallelic sites are skipped automatically
   - It drops allele-dependent FORMAT and INFO fields after polarisation, because
     values such as AD, PL, AC, and AF are no longer trustworthy after flipping
-  - The output should be re-annotated with snpEff before running the load summary
+  - Build a new snpEff database from an ancestral FASTA made with the companion
+    patch VCF before annotating the polarised VCF
   - In chromosome-batch mode, a tabix index is created automatically if missing
   - When running internal chromosome batches, the script uses SLURM_CPUS_PER_TASK
     if available, otherwise it runs one batch at a time
@@ -81,6 +86,7 @@ require_file() {
 VCF=""
 GROUPS_FILE=""
 OUT=""
+PATCHES=""
 PYTHON_BIN=""
 BGZIP_BIN=""
 TABIX_BIN=""
@@ -102,6 +108,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --out)
       OUT="${2:-}"
+      shift 2
+      ;;
+    --ancestral-patches)
+      PATCHES="${2:-}"
       shift 2
       ;;
     --python)
@@ -157,6 +167,7 @@ require_file "$GROUPS_FILE"
 if [[ -z "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(command -v python3 || true)"
 fi
+
 [[ -n "$PYTHON_BIN" ]] || die "python3 not found in PATH and --python was not provided"
 require_file "$PYTHON_BIN"
 
@@ -178,7 +189,7 @@ if [[ "$CHROMS_PER_BATCH" -gt 0 ]]; then
   [[ "$VCF" == *.gz ]] || die "--chromosomes-per-batch requires a bgzipped VCF"
   if [[ ! -f "${VCF}.tbi" && ! -f "${VCF}.csi" ]]; then
     printf 'No tabix index found, creating one for: %s\n' "$VCF"
-    "$TABIX_BIN" -f -p vcf "$VCF"
+    "$TABIX_BIN" -f -C -p vcf "$VCF"
   fi
 
   if [[ -z "$BATCH_INDEX" && -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
@@ -199,6 +210,14 @@ if [[ -z "$OUT" ]]; then
       ;;
   esac
 fi
+
+[[ "$OUT" == *.vcf.gz ]] || die "--out must end in .vcf.gz"
+if [[ -z "$PATCHES" ]]; then
+  PATCHES="${OUT%.vcf.gz}.ancestral_patches.vcf.gz"
+fi
+[[ "$PATCHES" == *.vcf.gz ]] || die "--ancestral-patches must end in .vcf.gz"
+[[ "$PATCHES" != "$OUT" ]] || die "Patch VCF and polarised VCF must have different paths"
+[[ "$OUT" != "$VCF" && "$PATCHES" != "$VCF" ]] || die "Output files must differ from input VCF"
 
 SELECTED_CHROMS=()
 TOTAL_CHROMS=0
@@ -239,26 +258,32 @@ if [[ "$REGION_MODE" -eq 1 ]]; then
         OUT="${OUT}${BATCH_SUFFIX}.vcf.gz"
         ;;
     esac
+    PATCHES="${PATCHES%.vcf.gz}${BATCH_SUFFIX}.vcf.gz"
   else
     INTERNAL_BATCH_MODE=1
   fi
 fi
 
-if [[ -f "$OUT" ]]; then
+if [[ -f "$OUT" || -f "$PATCHES" ]]; then
   if [[ "$SKIP_IF_EXISTS" -eq 1 && "$FORCE" -ne 1 ]]; then
-    printf 'Output already exists, skipping: %s\n' "$OUT"
-    exit 0
+    if [[ -f "$OUT" && -f "$PATCHES" ]]; then
+      printf 'Outputs already exist, skipping: %s and %s\n' "$OUT" "$PATCHES"
+      exit 0
+    fi
+    die "Only one output exists; use --force to regenerate both: $OUT $PATCHES"
   fi
   if [[ "$FORCE" -ne 1 ]]; then
-    die "Output already exists: $OUT (use --force or --skip-if-exists)"
+    die "Output already exists: $OUT or $PATCHES (use --force or --skip-if-exists)"
   fi
 fi
 
 TMP_VCF="${OUT%.gz}.tmp.vcf"
 TMP_OUT="${OUT}.tmp"
+TMP_PATCH_VCF="${PATCHES%.gz}.tmp.vcf"
+TMP_PATCH_OUT="${PATCHES}.tmp"
 WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "$WORK_DIR" "$TMP_VCF" "$TMP_OUT"' EXIT
-rm -f "$TMP_VCF" "$TMP_OUT"
+trap 'rm -rf "$WORK_DIR" "$TMP_VCF" "$TMP_OUT" "$TMP_PATCH_VCF" "$TMP_PATCH_OUT"' EXIT
+rm -f "$TMP_VCF" "$TMP_OUT" "$TMP_PATCH_VCF" "$TMP_PATCH_OUT"
 
 PY_HELPER="${WORK_DIR}/polarise_helper.py"
 cat > "$PY_HELPER" <<'PYCODE'
@@ -266,7 +291,7 @@ import gzip
 import sys
 from collections import Counter
 
-vcf_path, groups_path, allow_missing_flag = sys.argv[1:]
+vcf_path, groups_path, allow_missing_flag, patch_path = sys.argv[1:]
 allow_missing_outgroup = allow_missing_flag == "1"
 
 
@@ -339,12 +364,13 @@ stats = Counter()
 header_written = False
 gt_header_present = False
 
-with open_vcf(vcf_path) as handle:
+with open(patch_path, "w", encoding="utf-8") as patch_handle, open_vcf(vcf_path) as handle:
     for raw_line in handle:
         if raw_line.startswith("##"):
             if raw_line.startswith("##FORMAT=<ID=GT,"):
                 gt_header_present = True
             print(raw_line, end="")
+            patch_handle.write(raw_line)
             continue
 
         if raw_line.startswith("#CHROM"):
@@ -365,6 +391,7 @@ with open_vcf(vcf_path) as handle:
                 print('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">')
             print('##polarise_snpeff_vcf=Ancestral allele set from agreeing homozygous outgroups; output reduced to GT-only for load analyses')
             print(raw_line, end="")
+            patch_handle.write("\t".join(fields[:8]) + "\n")
             outgroup_indices = [sample_to_index[name] for name in sample_names if name in outgroup_names]
             header_written = True
             continue
@@ -386,7 +413,9 @@ with open_vcf(vcf_path) as handle:
             stats["skipped_multiallelic"] += 1
             continue
 
-        if len(ref) != 1 or len(alt) != 1:
+        if (len(ref) != 1 or len(alt) != 1 or
+                ref.upper() not in {"A", "C", "G", "T"} or
+                alt.upper() not in {"A", "C", "G", "T"}):
             stats["skipped_non_snp"] += 1
             continue
 
@@ -454,6 +483,7 @@ with open_vcf(vcf_path) as handle:
         print("\t".join(out_fields))
 
         if flip:
+            patch_handle.write("\t".join([chrom, pos, site_id, ref, alt, qual, filt, "."]) + "\n")
             stats["kept_flipped_sites"] += 1
         else:
             stats["kept_ref_ancestral_sites"] += 1
@@ -481,6 +511,7 @@ printf 'Polarising load VCF using outgroups\n'
 printf '  vcf    = %s\n' "$VCF"
 printf '  groups = %s\n' "$GROUPS_FILE"
 printf '  out    = %s\n' "$OUT"
+printf '  patches = %s\n' "$PATCHES"
 if [[ "$REGION_MODE" -eq 1 && "$INTERNAL_BATCH_MODE" -eq 0 ]]; then
   printf '  batch  = %s of %s\n' "$((BATCH_INDEX + 1))" "$TOTAL_BATCHES"
   printf '  chroms = %s\n' "$(IFS=,; printf '%s' "${SELECTED_CHROMS[*]}")"
@@ -492,7 +523,8 @@ fi
 run_python_to_output() {
 local vcf_input="$1"
 local out_vcf="$2"
-"$PYTHON_BIN" "$PY_HELPER" "$vcf_input" "$GROUPS_FILE" "$ALLOW_MISSING_OUTGROUP" > "$out_vcf"
+local patch_vcf="$3"
+"$PYTHON_BIN" "$PY_HELPER" "$vcf_input" "$GROUPS_FILE" "$ALLOW_MISSING_OUTGROUP" "$patch_vcf" > "$out_vcf"
 }
 
 process_batch() {
@@ -502,13 +534,16 @@ process_batch() {
   shift
   local batch_log="$1"
   shift
+  local batch_patch="$1"
+  shift
   local -a batch_chroms=("$@")
 
   {
     printf 'Batch %s chromosomes: %s\n' "$batch_index" "$(IFS=,; printf '%s' "${batch_chroms[*]}")"
-    "$TABIX_BIN" -h "$VCF" "${batch_chroms[@]}" | run_python_to_output "-" "${batch_out%.gz}"
+    "$TABIX_BIN" -h "$VCF" "${batch_chroms[@]}" | run_python_to_output "-" "${batch_out%.gz}" "${batch_patch%.gz}"
     "$BGZIP_BIN" -f -c "${batch_out%.gz}" > "$batch_out"
-    rm -f "${batch_out%.gz}"
+    "$BGZIP_BIN" -f -c "${batch_patch%.gz}" > "$batch_patch"
+    rm -f "${batch_out%.gz}" "${batch_patch%.gz}"
   } >"$batch_log" 2>&1
 }
 
@@ -519,6 +554,7 @@ if [[ "$INTERNAL_BATCH_MODE" -eq 1 ]]; then
 
   pids=()
   batch_outputs=()
+  batch_patches=()
   batch_logs=()
 
   for (( batch_i=0; batch_i<TOTAL_BATCHES; batch_i++ )); do
@@ -535,15 +571,17 @@ if [[ "$INTERNAL_BATCH_MODE" -eq 1 ]]; then
 
     batch_out="${BATCH_DIR}/batch$(printf '%03d' "$batch_i").vcf.gz"
     batch_log="${BATCH_DIR}/batch$(printf '%03d' "$batch_i").log"
+    batch_patch="${BATCH_DIR}/batch$(printf '%03d' "$batch_i").ancestral_patches.vcf.gz"
     batch_outputs+=("$batch_out")
+    batch_patches+=("$batch_patch")
     batch_logs+=("$batch_log")
 
-    if [[ -f "$batch_out" && "$FORCE" -eq 0 ]]; then
+    if [[ -f "$batch_out" && -f "$batch_patch" && "$FORCE" -eq 0 ]]; then
       printf 'Reusing existing batch output: %s\n' "$batch_out"
       continue
     fi
 
-    process_batch "$batch_i" "$batch_out" "$batch_log" "${batch_chroms[@]}" &
+    process_batch "$batch_i" "$batch_out" "$batch_log" "$batch_patch" "${batch_chroms[@]}" &
     pids+=("$!")
 
     while (( ${#pids[@]} >= MAX_PARALLEL_JOBS )); do
@@ -571,16 +609,31 @@ if [[ "$INTERNAL_BATCH_MODE" -eq 1 ]]; then
       fi
     done
   } | "$BGZIP_BIN" -c > "$TMP_OUT"
+  {
+    first_batch=1
+    for batch_file in "${batch_patches[@]}"; do
+      if [[ "$first_batch" -eq 1 ]]; then
+        gzip -cd "$batch_file"
+        first_batch=0
+      else
+        gzip -cd "$batch_file" | awk '!/^#/'
+      fi
+    done
+  } | "$BGZIP_BIN" -c > "$TMP_PATCH_OUT"
 elif [[ "$REGION_MODE" -eq 1 ]]; then
-  "$TABIX_BIN" -h "$VCF" "${SELECTED_CHROMS[@]}" | run_python_to_output "-" "$TMP_VCF"
+  "$TABIX_BIN" -h "$VCF" "${SELECTED_CHROMS[@]}" | run_python_to_output "-" "$TMP_VCF" "$TMP_PATCH_VCF"
 else
-  run_python_to_output "$VCF" "$TMP_VCF"
+  run_python_to_output "$VCF" "$TMP_VCF" "$TMP_PATCH_VCF"
 fi
 
 if [[ "$INTERNAL_BATCH_MODE" -eq 0 ]]; then
   "$BGZIP_BIN" -c "$TMP_VCF" > "$TMP_OUT"
+  "$BGZIP_BIN" -c "$TMP_PATCH_VCF" > "$TMP_PATCH_OUT"
 fi
 mv "$TMP_OUT" "$OUT"
-rm -f "$TMP_VCF"
+mv "$TMP_PATCH_OUT" "$PATCHES"
+rm -f "${OUT}.tbi" "${OUT}.csi" "${PATCHES}.tbi" "${PATCHES}.csi"
+rm -f "$TMP_VCF" "$TMP_PATCH_VCF"
 
 printf 'Finished: %s\n' "$OUT"
+printf 'Patches: %s\n' "$PATCHES"

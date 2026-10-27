@@ -138,6 +138,9 @@ done
 
 require_file "$FASTA"
 require_file "$GFF"
+FASTA="$(readlink -f "$FASTA")"
+mkdir -p "$OUTDIR"
+OUTDIR="$(cd "$OUTDIR" && pwd -P)"
 
 if [[ -z "$GENOME_NAME" ]]; then
   GENOME_NAME="$DB_ID"
@@ -145,6 +148,8 @@ fi
 
 if [[ -z "$CONFIG" ]]; then
   CONFIG="${OUTDIR}/snpEff.config"
+else
+  CONFIG="$(readlink -m "$CONFIG")"
 fi
 
 DATA_DIR="${OUTDIR}/data/${DB_ID}"
